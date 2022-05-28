@@ -37,9 +37,8 @@ def main():
   
   # ResNet model
   model = resnet.__dict__[args.arch]()
-  spec = [paddle.static.InputSpec([None] + config['dataset-img-size'])]
-  model = paddle.jit.to_static(model, input_spec=spec)
-
+  # spec = [paddle.static.InputSpec([None] + config['dataset-img-size'])]
+  # model = paddle.jit.to_static(model, input_spec=spec)
   # DataLoader
   train_dataloader = Cifar10DataLoader(
       is_training=True, data_file=args.data_file, batch_size=args.batch_size)
@@ -81,7 +80,6 @@ def main():
           last_mmt = new_mmt
           # print(last_lr, last_mmt, lr_scheduler.last_lr)
         last_lr = lr_scheduler.last_lr
-
       # Compute prediction and loss
       logits = model(images)
       loss = loss_fn(logits, labels)

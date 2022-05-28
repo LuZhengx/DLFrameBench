@@ -2,7 +2,6 @@ import mxnet as mx
 from mxnet.gluon.nn import Block
 from mxnet.gluon.data import vision, DataLoader
 from mxnet.gluon.data.vision import transforms
-import numpy as np
 
 from src.config import config
 
@@ -39,7 +38,7 @@ def Cifar10DataLoader(is_training, data_dir, batch_size,
   dataset = dataset.transform_first(transform)
 
   dataloader = DataLoader(
-      dataset, batch_size=batch_size, shuffle=is_training, pin_memory=True,
+      dataset, batch_size=batch_size, shuffle=is_training,
       last_batch='keep', num_workers=parallel_workers)
   
   return dataloader

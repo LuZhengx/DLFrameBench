@@ -73,17 +73,19 @@ class ResNet(paddle.nn.Layer):
     bias_attr = paddle.ParamAttr(initializer=nn.initializer.Constant(value=0.0))
     self.fc = paddle.nn.Linear(
         in_features=64, out_features=num_classes,
-        weight_attr=weight_attr, bias_attr=bias_attr)
+        weight_attr=weight_attr, bias_attr=bias_attr if config['dense-use-bias'] else False)
   
   def _make_layer(self, block, chs, num_blocks, stride):
     # Shortcut
     if config['downsample-shortcut'] == 'maxpool+padding':
       def shortcut(inputs):
-        if self.stride != 1:
-          inputs = self.maxpool(inputs)
-          zeroTensor = paddle.zeros([
+        if stride != 1:
+          inputs = F.max_pool2d(inputs, kernel_size=1, stride=2)
+          zeroTensor_b = paddle.zeros([
               inputs.shape[0], chs // 4, inputs.shape[2], inputs.shape[3]])
-          inputs = paddle.concat([zeroTensor, inputs, zeroTensor], axis=1)
+          zeroTensor_a = paddle.zeros([
+              inputs.shape[0], chs // 4, inputs.shape[2], inputs.shape[3]])
+          inputs = paddle.concat([zeroTensor_b, inputs, zeroTensor_a], axis=1)
         return inputs
     elif config['downsample-shortcut'] == 'convolution':
       if stride != 1:
@@ -105,7 +107,8 @@ class ResNet(paddle.nn.Layer):
       layers.append(block(self.in_chs, chs))
 
     return paddle.nn.Sequential(*tuple(layers))
-
+  
+  @paddle.jit.to_static
   def forward(self, inputs):
     x = self.conv1(inputs)
     x = self.bn1(x)
