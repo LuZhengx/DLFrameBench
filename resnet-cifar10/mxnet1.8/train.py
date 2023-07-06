@@ -4,6 +4,7 @@ import argparse
 import ctypes
 
 os.environ["MXNET_USE_FUSION"] = "0"
+# os.environ["MXNET_CUDNN_AUTOTUNE_DEFAULT"] = "0"
 
 import mxnet
 
@@ -65,19 +66,29 @@ def main():
     # Training process
     start_time = time.time()
     _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"epoch:{epoch}".encode('utf-8')))
+    # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
     for images, label in train_dataloader:
       # Move to gpu
       images = images.copyto(mxnet.gpu())
       label = label.copyto(mxnet.gpu())
       # Compute prediction and loss
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"forward".encode('utf-8')))
       with mxnet.autograd.record():
         logit = model(images)
         loss = loss_fn(logit, label)
       # Backpropagation
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"backpropagation".encode('utf-8')))
       loss.backward()
       # Update
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient update".encode('utf-8')))
       trainer.step(args.batch_size)
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
     # Training end, wait for all compute on gpu complete
+    # _cuda_tools_ext.nvtxRangePop()
     loss = loss.mean().asscalar()
     _cuda_tools_ext.nvtxRangePop()
     total_train_time += time.time() - start_time

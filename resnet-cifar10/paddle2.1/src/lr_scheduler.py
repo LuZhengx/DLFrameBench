@@ -6,7 +6,7 @@ def WarmUpAndMultiStep(batch_size, boundary_epochs=config['lr-decay-boundaries']
     decay_rates=config['lr-decay-rate'], base_lr=config['lr-base'], last_epoch=-1,
     warmup_rate=config['lr-warmup-rate'], warmup_epochs=config['lr-warmup-epochs']):
 
-  base_lr = config['lr-base'] * batch_size / config['lr-batch-denom']
+  base_lr = base_lr * batch_size / config['lr-batch-denom']
 
   # Reduce the learning rate at certain epochs.
   boundaries = [epoch for epoch in boundary_epochs]

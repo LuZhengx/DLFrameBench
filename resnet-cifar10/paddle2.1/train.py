@@ -37,8 +37,8 @@ def main():
   
   # ResNet model
   model = resnet.__dict__[args.arch]()
-  spec = [paddle.static.InputSpec([None] + config['dataset-img-size'])]
-  model = paddle.jit.to_static(model, input_spec=spec)
+  # spec = [paddle.static.InputSpec([None] + config['dataset-img-size'])]
+  # model = paddle.jit.to_static(model, input_spec=spec)
 
   # DataLoader
   train_dataloader = Cifar10DataLoader(
@@ -71,6 +71,7 @@ def main():
     model.train()
     start_time = time.time()
     _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"epoch:{epoch}".encode('utf-8')))
+    # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
     for images, labels in train_dataloader():
       # Adjust the momentum in optimizer
       # For the sake of fairness, don't do the adjustment in profiling
@@ -81,16 +82,26 @@ def main():
           last_mmt = new_mmt
           # print(last_lr, last_mmt, lr_scheduler.last_lr)
         last_lr = lr_scheduler.last_lr
-
       # Compute prediction and loss
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"forward".encode('utf-8')))
       logits = model(images)
       loss = loss_fn(logits, labels)
       # Backpropagation
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient clean".encode('utf-8')))
       optimizer.clear_grad()
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"backpropagation".encode('utf-8')))
       loss.backward()
       # Update
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient update".encode('utf-8')))
       optimizer.step()
+      # _cuda_tools_ext.nvtxRangePop()
+      # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
 
+    # _cuda_tools_ext.nvtxRangePop()
     # One step for lr scheduler
     lr_scheduler.step()
     # Training end, wait for all compute on gpu complete

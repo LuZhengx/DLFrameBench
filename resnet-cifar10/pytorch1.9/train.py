@@ -67,6 +67,7 @@ def main():
     model.train()
     start_time = time.time()
     _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"epoch:{epoch}".encode('utf-8')))
+    _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
     for X, y in train_dataloader:
       # Adjust the momentum in optimizer
       # For the sake of fairness, don't do the adjustment in profiling
@@ -86,14 +87,25 @@ def main():
       X = X.cuda()
       y = y.cuda()
       # Compute prediction and loss
+      _cuda_tools_ext.nvtxRangePop()
+      _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"forward".encode('utf-8')))
       pred = model(X)
       loss = loss_fn(pred, y)
       # Backpropagation
+      _cuda_tools_ext.nvtxRangePop()
+      _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient clean".encode('utf-8')))
       optimizer.zero_grad()
+      _cuda_tools_ext.nvtxRangePop()
+      _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"backpropagation".encode('utf-8')))
       loss.backward()
       # Update
+      _cuda_tools_ext.nvtxRangePop()
+      _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient update".encode('utf-8')))
       optimizer.step()
+      _cuda_tools_ext.nvtxRangePop()
+      _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
 
+    _cuda_tools_ext.nvtxRangePop()
     # One step for lr scheduler
     lr_scheduler.step()
     # Training end, wait for all compute on gpu complete

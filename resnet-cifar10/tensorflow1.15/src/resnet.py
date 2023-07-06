@@ -39,6 +39,7 @@ def conv2d_fixed_padding(inputs, filters, kernel_size, strides, data_format):
   return tf.layers.conv2d(
       inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
       padding=('VALID' if strides > 1 and config['conv2d-pytorch-style'] else 'SAME'),
+      use_bias = config['conv2d-use-bias'],
       kernel_initializer=tf.glorot_uniform_initializer(),
       data_format=data_format)
 

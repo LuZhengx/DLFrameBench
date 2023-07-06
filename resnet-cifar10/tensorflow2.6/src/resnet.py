@@ -133,13 +133,25 @@ class ResNet(tf.keras.Model):
 		return output
 
 def resnet20(data_format='channels_last'):
-    return ResNet(3, data_format=data_format)
+  return ResNet(3, data_format=data_format)
+
+def resnet38(data_format='channels_last'):
+  return ResNet(6, data_format=data_format)
 
 def resnet56(data_format='channels_last'):
-    return ResNet(9, data_format=data_format)
+  return ResNet(9, data_format=data_format)
 
 def resnet110(data_format='channels_last'):
-    return ResNet(18, data_format=data_format)
+  return ResNet(18, data_format=data_format)
+
+def resnet218(data_format='channels_last'):
+  return ResNet(36, data_format=data_format)
+
+def resnet434(data_format='channels_last'):
+  return ResNet(72, data_format=data_format)
+
+def resnet866(data_format='channels_last'):
+  return ResNet(144, data_format=data_format)
 
 def resnet1202(data_format='channels_last'):
-    return ResNet(200, data_format=data_format)
+  return ResNet(200, data_format=data_format)
