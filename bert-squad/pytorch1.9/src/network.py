@@ -35,6 +35,8 @@ from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import torch.nn.init as init
 
+from src.config import config
+
 logger = logging.getLogger(__name__)
 
 CONFIG_NAME = 'bert_config.json'
@@ -93,6 +95,12 @@ def gelu(x):
 
 def swish(x):
     return x * torch.sigmoid(x)
+
+def layernorm(hidden_size):
+    return nn.LayerNorm(hidden_size, eps=config['ln-epsilon'])
+
+def linear(in_chs, out_chs):
+    return nn.Linear(in_chs, out_chs, bias=config['dense-use-bias'])
 
 #torch.nn.functional.gelu(x) # Breaks ONNX export
 ACT2FN = {"gelu": gelu, "tanh": torch.tanh,  "relu": torch.nn.functional.relu, "swish": swish}
@@ -242,7 +250,7 @@ class BertEmbeddings(nn.Module):
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-12)
+        self.LayerNorm = layernorm(config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, input_ids, token_type_ids):
@@ -272,9 +280,9 @@ class BertSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.query = linear(config.hidden_size, self.all_head_size)
+        self.key = linear(config.hidden_size, self.all_head_size)
+        self.value = linear(config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -332,8 +340,8 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super(BertSelfOutput, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-12)
+        self.dense = linear(config.hidden_size, config.hidden_size)
+        self.LayerNorm = layernorm(config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -368,8 +376,8 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super(BertOutput, self).__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-12)
+        self.dense = linear(config.intermediate_size, config.hidden_size)
+        self.LayerNorm = layernorm(config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -635,7 +643,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         # TODO check with Google if it's normal there is no dropout on the token classifier of SQuAD in the TF version
         # self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.qa_outputs = nn.Linear(config.hidden_size, 2)  
+        self.qa_outputs = linear(config.hidden_size, 2)  
         self.apply(self.init_bert_weights)
 
     def forward(self, input_ids, token_type_ids, attention_mask):

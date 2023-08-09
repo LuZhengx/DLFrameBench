@@ -26,13 +26,12 @@ def parse_arg():
                              "bert-base-multilingual-cased, bert-base-chinese.")
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model checkpoints and predictions will be written.")
-    parser.add_argument("--predict_file", default=None, type=str, required=True,
-                        help="SQuAD json for predictions. E.g., dev-v1.1.json or test-v1.1.json")
+    parser.add_argument("--num_train_epochs", default=3.0, type=float,
+                        help="Total number of training epochs to perform.")
     parser.add_argument("--init_checkpoint", default=None, type=str, help="The checkpoint file from pretraining")
-    parser.add_argument("--config_file", default=None, type=str, required=False, help="The BERT model config")
+    parser.add_argument("--config_file", default=None, type=str, required=False,
+                        help="The BERT model config for loading checkpoint file")
 
-    ## Other parameters
-    parser.add_argument("--train_file", default=None, type=str, help="SQuAD json for training. E.g., train-v1.1.json")
     parser.add_argument("--max_seq_length", default=384, type=int,
                         help="The maximum total input sequence length after WordPiece tokenization. Sequences "
                              "longer than this will be truncated, and sequences shorter than this will be padded.")
@@ -41,10 +40,6 @@ def parse_arg():
     parser.add_argument("--max_query_length", default=64, type=int,
                         help="The maximum number of tokens for the question. Questions longer than this will "
                              "be truncated to this length.")
-    parser.add_argument("--train_batch_size", default=32, type=int, help="Total batch size for training.")
-    parser.add_argument("--predict_batch_size", default=8, type=int, help="Total batch size for predictions.")
-    parser.add_argument("--num_train_epochs", default=3.0, type=float,
-                        help="Total number of training epochs to perform.")
     parser.add_argument("--n_best_size", default=20, type=int,
                         help="The total number of n-best predictions to generate in the nbest_predictions.json "
                              "output file.")
@@ -63,10 +58,6 @@ def parse_arg():
     parser.add_argument('--null_score_diff_threshold',
                         type=float, default=0.0,
                         help="If null_score - best_non_null is greater than the threshold predict null.")
-    parser.add_argument("--eval_script",
-                        help="Script to evaluate squad predictions",
-                        default="evaluate-v1.1.py",
-                        type=str)
     parser.add_argument('--disable-progress-bar',
                         default=False,
                         action='store_true',
@@ -125,7 +116,7 @@ def main():
         print(f"{name}: {mean:.6f}, {var:.6f}")
 
     # Train DataLoader
-    _, train_features = load_squad_features(args, args.train_file, True)
+    _, train_features = load_squad_features(args, config["train-file"], True)
     all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
@@ -133,20 +124,20 @@ def main():
     all_end_positions = torch.tensor([f.end_position for f in train_features], dtype=torch.long)
     train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
                                all_start_positions, all_end_positions)
-    train_dataloader = DataLoader(train_data, batch_size=args.train_batch_size, shuffle=True,
+    train_dataloader = DataLoader(train_data, batch_size=config["train-batch-size"], shuffle=True,
                                   pin_memory=True, num_workers=config['dataset-num-workers'], persistent_workers=True)
     
-    step_size = int(len(train_features) / args.train_batch_size)
+    step_size = int(len(train_features) / config["train-batch-size"])
     num_train_optimization_steps = step_size * args.num_train_epochs
     
     # Eval DataLoader
-    eval_examples, eval_features = load_squad_features(args, args.predict_file, False)
+    eval_examples, eval_features = load_squad_features(args, config["predict-file"], False)
     all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
     all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
     eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_example_index)
-    eval_dataloader = DataLoader(eval_data, batch_size=args.predict_batch_size, shuffle=False,
+    eval_dataloader = DataLoader(eval_data, batch_size=config["predict-batch-size"], shuffle=False,
                                   pin_memory=True, num_workers=config['dataset-num-workers'], persistent_workers=True)
 
     # Optimizer
@@ -162,7 +153,7 @@ def main():
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': config['weight-decay']},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-    lr = config['lr-base'] * args.train_batch_size / config['lr-batch-denom']
+    lr = config['lr-base'] * config["train-batch-size"] / config['lr-batch-denom']
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, betas=(0.9, 0.999), eps=1e-6)
 
     # LR Scheduler
@@ -232,10 +223,10 @@ def main():
                 f.write(json.dumps(answers, indent=4) + "\n")
 
             # Running the eval script
-            eval_script = os.path.join(os.path.dirname(args.predict_file), args.eval_script)
+            eval_script = os.path.join(os.path.dirname(config["predict-file"]), config["eval_script"])
             print('script is {}'.format(eval_script))
             eval_out = subprocess.check_output([sys.executable, eval_script,
-                                                args.predict_file, output_prediction_file])
+                                                config["predict-file"], output_prediction_file])
             scores = str(eval_out).strip()
             exact_match = float(scores.split(":")[1].split(",")[0])
             f1 = float(scores.split(":")[2].split(",")[0])
