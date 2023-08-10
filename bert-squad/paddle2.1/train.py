@@ -6,8 +6,8 @@ import argparse
 import ctypes
 import subprocess
 
-import torch
-from torch.utils.data import (DataLoader, TensorDataset)
+import paddle
+from paddle.io import Dataset, DataLoader
 from tqdm import *
 
 sys.path.append('..')
@@ -77,6 +77,29 @@ def parse_arg():
     args = parser.parse_args()
     return args
 
+
+# Because padddle 2.1 does not support TensorDataset on GPU
+# We construct the dataset for SQuAD
+class SQuADDataset(Dataset):
+    def __init__(self, features, is_train=True):
+        self.features = features
+        self.is_train = is_train
+
+    def __getitem__(self, idx):
+        input_ids = paddle.to_tensor(self.features[idx].input_ids, dtype=paddle.int64)
+        input_mask = paddle.to_tensor(self.features[idx].input_mask, dtype=paddle.int64)
+        segment_ids = paddle.to_tensor(self.features[idx].segment_ids, dtype=paddle.int64)
+        if self.is_train: 
+            start_position = paddle.to_tensor(self.features[idx].start_position, dtype=paddle.int64)
+            end_position = paddle.to_tensor(self.features[idx].end_position, dtype=paddle.int64)
+            return input_ids, input_mask, segment_ids, start_position, end_position
+        else:
+            return input_ids, input_mask, segment_ids, paddle.to_tensor(idx, dtype=paddle.int64)
+
+    def __len__(self):
+        return len(self.features)
+
+
 def main():
     
     args = parse_arg()
@@ -90,55 +113,34 @@ def main():
         os.makedirs(args.output_dir)
 
     _cuda_tools_ext = ctypes.CDLL("libnvToolsExt.so")
-    torch.backends.cudnn.benchmark = True
-    
-    # device
-    device = torch.device("cuda", 0)
+
 
     # model
-    if args.init_checkpoint:
-        config_file = BertConfig.from_json_file(args.config_file)
-        # Padding for divisibility by 8
-        if config_file.vocab_size % 8 != 0:
-            config_file.vocab_size += 8 - (config_file.vocab_size % 8)
-        model = BertForQuestionAnswering(config_file)
-        checkpoint = torch.load(args.init_checkpoint, map_location='cpu')
-        checkpoint = checkpoint["model"] if "model" in checkpoint.keys() else checkpoint
-        model.load_state_dict(checkpoint, strict=False)
-        print(f"Load model from checkpoint: {args.init_checkpoint}")
-    else:
-        model = BertForQuestionAnswering.from_pretrained(args.bert_model)
-        print(f"Load model from pretrained: {args.bert_model}")
-    model = model.to(device)
+    model = BertForQuestionAnswering.from_pretrained(args.bert_model)
+    print(f"Load model from pretrained: {args.bert_model}")
     for name, param in list(model.named_parameters()):
-        mean = param.mean()
-        var = param.var()
+        mean = param.mean().item()
+        var = param.var().item()
         print(f"{name}: {mean:.6f}, {var:.6f}")
 
     # Train DataLoader
     _, train_features = load_squad_features(args, config["train-file"], True)
-    all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
-    all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
-    all_start_positions = torch.tensor([f.start_position for f in train_features], dtype=torch.long)
-    all_end_positions = torch.tensor([f.end_position for f in train_features], dtype=torch.long)
-    train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
-                               all_start_positions, all_end_positions)
+    train_data = SQuADDataset(train_features, True)
     train_dataloader = DataLoader(train_data, batch_size=config["train-batch-size"], shuffle=True,
-                                  pin_memory=True, num_workers=config['dataset-num-workers'], persistent_workers=True)
-    
+                                num_workers=config['dataset-num-workers'])
+
     step_size = int(len(train_features) / config["train-batch-size"])
     num_train_optimization_steps = step_size * args.num_train_epochs
-    
+
     # Eval DataLoader
     eval_examples, eval_features = load_squad_features(args, config["predict-file"], False)
-    all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
-    all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
-    all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
-    eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_example_index)
+    eval_data = SQuADDataset(eval_features, False)
     eval_dataloader = DataLoader(eval_data, batch_size=config["predict-batch-size"], shuffle=False,
-                                  pin_memory=True, num_workers=config['dataset-num-workers'], persistent_workers=True)
+                                num_workers=config['dataset-num-workers'])
+
+    # LR Scheduler
+    lr = config['lr-base'] * config["train-batch-size"] / config['lr-batch-denom']
+    scheduler = LinearWarmUpScheduler(lr, warmup=config['lr-warmup-proportion'], total_steps=num_train_optimization_steps)
 
     # Optimizer
     assert config['optimizer-type'] == 'AdamW'
@@ -146,45 +148,37 @@ def main():
 
     # hack to remove pooler, which is not used
     # thus it produce None grad that break apex
-    param_optimizer = [n for n in param_optimizer if 'pooler' not in n[0]]
-
+    param_optimizer = [n[1] for n in param_optimizer if 'pooler' not in n[0]]
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': config['weight-decay']},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
-    lr = config['lr-base'] * config["train-batch-size"] / config['lr-batch-denom']
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, betas=(0.9, 0.999), eps=1e-6)
 
-    # LR Scheduler
-    scheduler = LinearWarmUpScheduler(optimizer, warmup=config['lr-warmup-proportion'], total_steps=num_train_optimization_steps)
+    optimizer = paddle.optimizer.AdamW(parameters=param_optimizer, learning_rate=scheduler, beta1=0.9, beta2=0.999,
+                                        epsilon=1e-6, weight_decay=config['weight-decay'],
+                                        apply_decay_param_fun=(lambda x: not any(nd in x for nd in no_decay)))
     
     # Record the Total time for train
     total_train_time = 0
     for epoch in range(int(args.num_train_epochs)):
         # Log some infomations
         print(f"--------Epoch: {epoch:03}, " +
-            f"lr: {optimizer.param_groups[0]['lr']:f}--------")
+              f"lr: {optimizer._learning_rate():f}--------")
         # Training loop
         model.train()
-        train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar)
+        train_iter = tqdm(train_dataloader(), desc="Iteration", disable=args.disable_progress_bar)
         start_time = time.time()
         for batch in train_iter:
-            # Move to device
-            batch = tuple(t.to(device) for t in batch)
             input_ids, input_mask, segment_ids, start_positions, end_positions = batch
             # Compute prediction and loss
             start_logits, end_logits = model(input_ids, segment_ids, input_mask)
             # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = start_logits.size(1)
-            start_positions.clamp_(0, ignored_index)
-            end_positions.clamp_(0, ignored_index)
-            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
+            ignored_index = start_logits.shape[1]
+            start_positions.clip_(0, ignored_index)
+            end_positions.clip_(0, ignored_index)
+            loss_fct = paddle.nn.CrossEntropyLoss(ignore_index=ignored_index)
             start_loss = loss_fct(start_logits, start_positions)
             end_loss = loss_fct(end_logits, end_positions)
             loss = (start_loss + end_loss) / 2
             # Backpropagation
-            optimizer.zero_grad()
+            optimizer.clear_grad()
             loss.backward()
             # Update (TODO: gradient clipping max_grad_norm=1.0)
             optimizer.step()
@@ -199,17 +193,15 @@ def main():
             # Validation process
             model.eval()
             all_results = []
-            eval_iter = tqdm(eval_dataloader, desc="Iteration", disable=args.disable_progress_bar)
+            eval_iter = tqdm(eval_dataloader(), desc="Iteration", disable=args.disable_progress_bar)
             for batch in eval_iter:
-                # Move to device
-                batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, example_indices = batch
                 # Forward computing
-                with torch.no_grad():
+                with paddle.no_grad():
                     batch_start_logits, batch_end_logits = model(input_ids, segment_ids, input_mask)
                 for i, example_index in enumerate(example_indices):
-                    start_logits = batch_start_logits[i].detach().cpu().tolist()
-                    end_logits = batch_end_logits[i].detach().cpu().tolist()
+                    start_logits = batch_start_logits[i].numpy().tolist()
+                    end_logits = batch_end_logits[i].numpy().tolist()
                     eval_feature = eval_features[example_index.item()]
                     unique_id = int(eval_feature.unique_id)
                     all_results.append(RawResult(unique_id=unique_id,

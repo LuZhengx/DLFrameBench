@@ -26,14 +26,10 @@ import os
 import sys
 from io import open
 
-import torch
-from torch import nn
+import paddle
+import paddle.nn.functional as F
+import paddle.nn as nn
 import numpy as np
-
-from torch.nn import Module
-from torch.nn.parameter import Parameter
-import torch.nn.functional as F
-import torch.nn.init as init
 
 from src.config import config
 
@@ -41,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 CONFIG_NAME = 'bert_config.json'
 WEIGHTS_NAME = 'ckpt.npz'
+
+# four differences from pytorch
+# transpose/premute, view, contiguous, split
+# https://www.paddlepaddle.org.cn/documentation/docs/zh/guides/model_convert/convert_from_pytorch/pytorch_api_mapping_cn.html
 
 def load_numpy_weights_in_bert(model, numpy_checkpoint_path):
     """ Load tf checkpoints in a pytorch model
@@ -79,69 +79,30 @@ def load_numpy_weights_in_bert(model, numpy_checkpoint_path):
             continue
         if m_name[-11:] == '_embeddings':
             pointer = getattr(pointer, 'weight')
-        elif m_name == 'kernel':
-            array = np.ascontiguousarray(np.transpose(array))
         try:
-            assert pointer.shape == array.shape
+            for pshape, ashape in zip(pointer.shape, array.shape):
+                assert pshape == ashape
         except AssertionError as e:
-            e.args += (pointer.shape, array.shape)
+            e.args += (pointer.shape, array.shape, name)
             raise
-        print("Initialize PyTorch weight {}".format(name))
-        pointer.data = torch.from_numpy(array)
+        print("Initialize Paddle weight {}".format(name))
+        pointer.set_value(paddle.to_tensor(array))
     return model
 
 def gelu(x):
-    return torch.nn.functional.gelu(x)
+    return F.gelu(x)
 
 def swish(x):
-    return x * torch.sigmoid(x)
+    return x * F.sigmoid(x)
 
 def layernorm(hidden_size):
-    return nn.LayerNorm(hidden_size, eps=config['ln-epsilon'])
+    return nn.LayerNorm(hidden_size, epsilon=config['ln-epsilon'])
 
 def linear(in_chs, out_chs):
-    return nn.Linear(in_chs, out_chs, bias=config['dense-use-bias'])
+    return nn.Linear(in_chs, out_chs, bias_attr=config['dense-use-bias'])
 
 #torch.nn.functional.gelu(x) # Breaks ONNX export
-ACT2FN = {"gelu": gelu, "tanh": torch.tanh,  "relu": torch.nn.functional.relu, "swish": swish}
-
-class LinearActivation(Module):
-    r"""Fused Linear and activation Module.
-    """
-    __constants__ = ['bias']
-
-    def __init__(self, in_features, out_features, act='gelu', bias=True):
-        super(LinearActivation, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.bias = None
-        assert act in ACT2FN, "Activation function is not found in activation dictionary."
-        self.act_fn = ACT2FN[act]
-        self.weight = Parameter(torch.Tensor(out_features, in_features))
-        if bias:
-            self.bias = Parameter(torch.Tensor(out_features))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
-            init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, input):
-        #if not self.bias is None:
-        #    return self.biased_act_fn(self.bias, F.linear(input, self.weight, None))
-        #else:
-        return self.act_fn(F.linear(input, self.weight, self.bias))
-
-    def extra_repr(self):
-        return 'in_features={}, out_features={}, bias={}'.format(
-            self.in_features, self.out_features, self.bias is not None
-        )
-
+ACT2FN = {"gelu": gelu, "tanh": F.tanh,  "relu": F.relu, "swish": swish}
 
 class BertConfig(object):
     """Configuration class to store the configuration of a `BertModel`.
@@ -239,7 +200,7 @@ class BertConfig(object):
             writer.write(self.to_json_string())
 
 
-class BertEmbeddings(nn.Module):
+class BertEmbeddings(nn.Layer):
     """Construct the embeddings from word, position and token_type embeddings.
     """
     def __init__(self, config):
@@ -254,8 +215,8 @@ class BertEmbeddings(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, input_ids, token_type_ids):
-        seq_length = input_ids.size(1)
-        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+        seq_length = input_ids.shape[1]
+        position_ids = paddle.arange(seq_length, dtype=paddle.int64)
         position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
         words_embeddings = self.word_embeddings(input_ids)
@@ -269,7 +230,7 @@ class BertEmbeddings(nn.Module):
         return embeddings
 
 
-class BertSelfAttention(nn.Module):
+class BertSelfAttention(nn.Layer):
     def __init__(self, config):
         super(BertSelfAttention, self).__init__()
         if config.hidden_size % config.num_attention_heads != 0:
@@ -288,18 +249,18 @@ class BertSelfAttention(nn.Module):
 
     def transpose_for_scores(self, x):
         # seq: x.size(0), bsz: x.size(0)
-        x = x.view(x.size(0), x.size(1) * self.num_attention_heads, self.attention_head_size).transpose(0, 1)
+        x = x.reshape((x.shape[0], x.shape[1] * self.num_attention_heads, self.attention_head_size)).transpose((1, 0, 2))
         return x
 
     def transpose_key_for_scores(self, x):
         # seq: x.size(0), bsz: x.size(0)
-        x = x.view(x.size(0), x.size(1) * self.num_attention_heads, self.attention_head_size).permute(1, 2, 0)
+        x = x.reshape((x.shape[0], x.shape[1] * self.num_attention_heads, self.attention_head_size)).transpose((1, 2, 0))
         return x
 
     def forward(self, hidden_states, attention_mask):
         # (seq, bsz, hidden)
-        batch_size = hidden_states.size(1)
-        seq_length = hidden_states.size(0)
+        batch_size = hidden_states.shape[1]
+        seq_length = hidden_states.shape[0]
 
         mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(hidden_states)
@@ -310,34 +271,34 @@ class BertSelfAttention(nn.Module):
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.bmm(query_layer, key_layer)
+        attention_scores = paddle.bmm(query_layer, key_layer)
         # (bsz, heads, seq, seq)
-        attention_scores = attention_scores.view(batch_size,
-                                                 self.num_attention_heads,
-                                                 seq_length, seq_length)
+        attention_scores = attention_scores.reshape((batch_size,
+                                                   self.num_attention_heads,
+                                                   seq_length, seq_length))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
         attention_scores = attention_scores + attention_mask
 
         # Normalize the attention scores to probabilities.
-        attention_probs = F.softmax(attention_scores, dim=-1)
+        attention_probs = F.softmax(attention_scores, axis=-1)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         # (bsz, heads, seq, seq)
         attention_probs = self.dropout(attention_probs)
-        attention_probs = attention_probs.view(batch_size * self.num_attention_heads,
-                                               seq_length, seq_length)
+        attention_probs = attention_probs.reshape((batch_size * self.num_attention_heads,
+                                                   seq_length, seq_length))
 
-        context_layer = torch.bmm(attention_probs, value_layer)
-        context_layer = context_layer.transpose(0, 1).contiguous()
+        context_layer = paddle.bmm(attention_probs, value_layer)
+        context_layer = context_layer.transpose((1, 0, 2))
         # (seq, bsz, hidden)
-        context_layer = context_layer.view(seq_length, batch_size, self.all_head_size)
+        context_layer = context_layer.reshape((seq_length, batch_size, self.all_head_size))
 
         return context_layer
 
 
-class BertSelfOutput(nn.Module):
+class BertSelfOutput(nn.Layer):
     def __init__(self, config):
         super(BertSelfOutput, self).__init__()
         self.dense = linear(config.hidden_size, config.hidden_size)
@@ -351,7 +312,7 @@ class BertSelfOutput(nn.Module):
         return hidden_states
 
 
-class BertAttention(nn.Module):
+class BertAttention(nn.Layer):
     def __init__(self, config):
         super(BertAttention, self).__init__()
         self.self = BertSelfAttention(config)
@@ -363,17 +324,18 @@ class BertAttention(nn.Module):
         return attention_output
 
 
-class BertIntermediate(nn.Module):
+class BertIntermediate(nn.Layer):
     def __init__(self, config):
         super(BertIntermediate, self).__init__()
-        self.dense = LinearActivation(config.hidden_size, config.intermediate_size, act=config.hidden_act)
+        self.dense = linear(config.hidden_size, config.intermediate_size)
+        self.act = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
-        return hidden_states
+        return self.act(hidden_states)
 
 
-class BertOutput(nn.Module):
+class BertOutput(nn.Layer):
     def __init__(self, config):
         super(BertOutput, self).__init__()
         self.dense = linear(config.intermediate_size, config.hidden_size)
@@ -387,7 +349,7 @@ class BertOutput(nn.Module):
         return hidden_states
 
 
-class BertLayer(nn.Module):
+class BertLayer(nn.Layer):
     def __init__(self, config):
         super(BertLayer, self).__init__()
         self.attention = BertAttention(config)
@@ -402,17 +364,17 @@ class BertLayer(nn.Module):
         return layer_output
 
 
-class BertEncoder(nn.Module):
+class BertEncoder(nn.Layer):
     def __init__(self, config):
         super(BertEncoder, self).__init__()
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.LayerList([BertLayer(config) for _ in range(config.num_hidden_layers)])
         self.output_all_encoded_layers = config.output_all_encoded_layers
 
     def forward(self, hidden_states, attention_mask):
         all_encoder_layers = []
 
         # (bsz, seq, hidden) => (seq, bsz, hidden)
-        hidden_states = hidden_states.transpose(0, 1)
+        hidden_states = hidden_states.transpose((1, 0, 2))
         for i, layer_module in enumerate(self.layer):
             hidden_states = layer_module(hidden_states, attention_mask)
 
@@ -421,27 +383,28 @@ class BertEncoder(nn.Module):
         # The hidden states need to be contiguous at this point to enable
         # dense_sequence_output
         # (seq, bsz, hidden) => (bsz, seq, hidden)
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
+        hidden_states = hidden_states.transpose((1, 0, 2))
 
         if not self.output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
         return all_encoder_layers
 
 
-class BertPooler(nn.Module):
+class BertPooler(nn.Layer):
     def __init__(self, config):
         super(BertPooler, self).__init__()
-        self.dense = LinearActivation(config.hidden_size, config.hidden_size, act="tanh")
+        self.dense = linear(config.hidden_size, config.hidden_size)
+        self.act = ACT2FN["tanh"]
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
-        return pooled_output
+        return self.act(pooled_output)
 
 
-class BertPreTrainedModel(nn.Module):
+class BertPreTrainedModel(nn.Layer):
     """ An abstract class to handle weights initialization and
         a simple interface for dowloading and loading pretrained models.
     """
@@ -462,12 +425,13 @@ class BertPreTrainedModel(nn.Module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            module.weight.set_value(
+                paddle.tensor.normal(mean=0.0, std=self.config.initializer_range, shape=module.weight.shape))
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+            module.bias.set_value(paddle.tensor.zeros_like(module.bias))
+            module.weight.set_value(paddle.tensor.ones_like(module.weight))
         if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+            module.bias.set_value(paddle.tensor.zeros_like(module.bias))
 
     def enable_apex(self, val):
         def _apply_flag(module):
@@ -574,9 +538,9 @@ class BertModel(BertPreTrainedModel):
         # this attention mask is more simple than the triangular masking of causal attention
         # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
+            attention_mask = paddle.ones_like(input_ids)
         if token_type_ids is None:
-            token_type_ids = torch.zeros_like(input_ids)
+            token_type_ids = paddle.zeros_like(input_ids)
 
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
 
@@ -585,18 +549,18 @@ class BertModel(BertPreTrainedModel):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
-        extended_attention_mask = extended_attention_mask.to(dtype=self.embeddings.word_embeddings.weight.dtype) # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.astype(self.embeddings.word_embeddings.weight.dtype) # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output = self.embeddings(input_ids, token_type_ids)
         encoded_layers = self.encoder(embedding_output, extended_attention_mask)
         
-        #see paddle
-        #sequence_output = encoded_layers[-1]
-        #pooled_output = self.pooler(sequence_output)
+        # Warning: no use for SQuAD, but will raise error when call paddle.jit.to_static
+        # sequence_output = encoded_layers[-1]
+        # pooled_output = self.pooler(sequence_output)
         if not self.output_all_encoded_layers:
             encoded_layers = encoded_layers[-1:]
-        return encoded_layers, None#pooled_output
+        return encoded_layers, None#, pooled_output
 
 
 class BertForQuestionAnswering(BertPreTrainedModel):
@@ -647,11 +611,12 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         self.qa_outputs = linear(config.hidden_size, 2)  
         self.apply(self.init_bert_weights)
 
+    @paddle.jit.to_static
     def forward(self, input_ids, token_type_ids, attention_mask):
         encoded_layers, _ = self.bert(input_ids, token_type_ids, attention_mask)
         sequence_output = encoded_layers[-1]
         logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits, end_logits = logits.split(2, axis=-1)
         start_logits = start_logits.squeeze(-1)
         end_logits = end_logits.squeeze(-1)
         return start_logits, end_logits
