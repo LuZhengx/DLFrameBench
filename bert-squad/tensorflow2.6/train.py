@@ -6,19 +6,16 @@ import argparse
 import ctypes
 import subprocess
 
-os.environ["MXNET_USE_FUSION"] = "0"
-# os.environ["MXNET_CUDNN_AUTOTUNE_DEFAULT"] = "0"
-
-import mxnet
-from mxnet.gluon.data import DataLoader, ArrayDataset
+import tensorflow as tf
+from tensorflow.data import Dataset
 from tqdm import *
 
 sys.path.append('..')
 from common.squad import (load_squad_features, RawResult, get_answers)
 from src.config import config
 from src.network import BertForQuestionAnswering, BertConfig
-from src.lr_scheduler import LinearWarmUpScheduler
-from src.optimizer import AdamW
+from src.optimizer import create_optimizer
+# from src.lr_scheduler import LinearWarmUpScheduler
 
 
 def parse_arg():
@@ -81,7 +78,6 @@ def parse_arg():
     args = parser.parse_args()
     return args
 
-
 def main():
     
     args = parse_arg()
@@ -98,112 +94,110 @@ def main():
 
     # model
     model = BertForQuestionAnswering.from_pretrained(args.bert_model, args.max_seq_length)
-    model.hybridize()
     print(f"Load model from pretrained: {args.bert_model}")
-    for name, param in list(model.collect_params().items()):
-        mean = param.data().mean().asscalar()
-        var = ((param.data() - mean)**2).sum().asscalar() / param.data().size
-        print(f"{name}: {mean:.6f}, {var:.6f}, {param.shape}")
+    for param in list(model.get_weights()):
+        mean = tf.math.reduce_mean(param)
+        var = tf.math.reduce_variance(param)
+        print(f": {mean:.6f}, {var:.6f}")
 
     # Train DataLoader
     _, train_features = load_squad_features(args, config["train-file"], True)
-    all_input_ids = mxnet.nd.array([f.input_ids for f in train_features], dtype='int64')
-    all_input_mask = mxnet.nd.array([f.input_mask for f in train_features], dtype='int64')
-    all_segment_ids = mxnet.nd.array([f.segment_ids for f in train_features], dtype='int64')
-    all_start_positions = mxnet.nd.array([f.start_position for f in train_features], dtype='int64')
-    all_end_positions = mxnet.nd.array([f.end_position for f in train_features], dtype='int64')
-    train_data = ArrayDataset(all_input_ids, all_input_mask, all_segment_ids,
-                               all_start_positions, all_end_positions)
-    train_dataloader = DataLoader(train_data, batch_size=config["train-batch-size"], shuffle=True,
-                                  last_batch='keep', num_workers=config['dataset-num-workers'])
-
+    all_input_ids = tf.convert_to_tensor([f.input_ids for f in train_features], dtype='int64')
+    all_input_mask = tf.convert_to_tensor([f.input_mask for f in train_features], dtype='int64')
+    all_segment_ids = tf.convert_to_tensor([f.segment_ids for f in train_features], dtype='int64')
+    all_start_positions = tf.convert_to_tensor([f.start_position for f in train_features], dtype='int64')
+    all_end_positions = tf.convert_to_tensor([f.end_position for f in train_features], dtype='int64')
+    train_data = Dataset.from_tensor_slices((all_input_ids, all_input_mask, all_segment_ids,
+                                             all_start_positions, all_end_positions))
+    # Shuffles records & repeating for training
+    train_data = train_data.shuffle(100).batch(
+        config["train-batch-size"], drop_remainder=False).prefetch(buffer_size=tf.data.AUTOTUNE)
+    
     step_size = int(len(train_features) / config["train-batch-size"])
     num_train_optimization_steps = step_size * args.num_train_epochs
-
+    
     # Eval DataLoader
     eval_examples, eval_features = load_squad_features(args, config["predict-file"], False)
-    all_input_ids = mxnet.nd.array([f.input_ids for f in eval_features], dtype='int64')
-    all_input_mask = mxnet.nd.array([f.input_mask for f in eval_features], dtype='int64')
-    all_segment_ids = mxnet.nd.array([f.segment_ids for f in eval_features], dtype='int64')
-    all_example_index = mxnet.nd.arange(all_input_ids.shape[0], dtype='int64')
-    eval_data = ArrayDataset(all_input_ids, all_input_mask, all_segment_ids, all_example_index)
-    eval_dataloader = DataLoader(eval_data, batch_size=config["predict-batch-size"], shuffle=False,
-                                 last_batch='keep', num_workers=config['dataset-num-workers'])
-    
-    # LR Scheduler
-    lr = config['lr-base'] * config["train-batch-size"] / config['lr-batch-denom']
-    scheduler = LinearWarmUpScheduler(lr, warmup=config['lr-warmup-proportion'], total_steps=num_train_optimization_steps)
+    all_input_ids = tf.convert_to_tensor([f.input_ids for f in eval_features], dtype='int64')
+    all_input_mask = tf.convert_to_tensor([f.input_mask for f in eval_features], dtype='int64')
+    all_segment_ids = tf.convert_to_tensor([f.segment_ids for f in eval_features], dtype='int64')
+    all_example_index = tf.range(all_input_ids.shape[0], dtype='int64')
+    eval_data = Dataset.from_tensor_slices((all_input_ids, all_input_mask, all_segment_ids, all_example_index))
+    # Shuffles records & repeating for training
+    eval_data = eval_data.batch(config["train-batch-size"], drop_remainder=False).prefetch(buffer_size=tf.data.AUTOTUNE)
 
     # Optimizer
     assert config['optimizer-type'] == 'AdamW'
-    # hack to remove pooler, which is not used
-    # thus it produce None grad that break apex
-    param_optimizer = model.collect_params('(?!pool)')
-
-    no_decay = ['bias', 'gamma', 'beta']
-    for name, param in param_optimizer.items():
-        if any(nd in name for nd in no_decay):
-            param.wd_mult = 0
-
-    optimizer = AdamW(lr_scheduler=scheduler, beta1=0.9, beta2=0.999, learning_rate=None,
-                      epsilon=1e-6, wd=config['weight-decay'])
-    trainer = mxnet.gluon.Trainer(param_optimizer, optimizer=optimizer)
+    training_vars = model.trainable_variables
+    lr = config['lr-base'] * config["train-batch-size"] / config['lr-batch-denom']
+    optimizer = create_optimizer(lr, num_train_optimization_steps,
+                                 int(num_train_optimization_steps*config['lr-warmup-proportion']), 'adam',     
+                                 weight_decay_rate=0.01,
+                                 beta_1=0.9,
+                                 beta_2=0.999,
+                                 epsilon=1e-6,
+                                 exclude_from_weight_decay=['LayerNorm', 'layer_norm', 'bias'])
     
+    @tf.function
+    def train_step(batch):
+        input_ids, input_mask, segment_ids, start_positions, end_positions = batch
+        with tf.GradientTape() as tape:
+            # Compute prediction and loss
+            start_logits, end_logits = model(input_ids, segment_ids, input_mask, training=True)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = tf.cast(tf.shape(start_logits)[1], 'int64')
+            start_positions = tf.clip_by_value(start_positions, 0, ignored_index)
+            end_positions = tf.clip_by_value(end_positions, 0, ignored_index)
+            start_loss = tf.keras.backend.sparse_categorical_crossentropy(
+                start_positions, start_logits, from_logits=True)
+            end_loss = tf.keras.backend.sparse_categorical_crossentropy(
+                end_positions, end_logits, from_logits=True)
+            loss = (tf.reduce_mean(start_loss) + tf.reduce_mean(end_loss)) / 2
+        # Backpropagation
+        grads = tape.gradient(loss, training_vars)
+        # Update (TODO: gradient clipping max_grad_norm=1.0)
+        optimizer.apply_gradients(zip(grads, training_vars))
+        return loss
+
+    @tf.function
+    def val_step(batch):
+        input_ids, input_mask, segment_ids, _ = batch
+        # Forward computing
+        return model(input_ids, segment_ids, input_mask, training=False)
+
     # Record the Total time for train
     total_train_time = 0
     for epoch in range(int(args.num_train_epochs)):
         # Log some infomations
         print(f"--------Epoch: {epoch:03}, " +
-              f"lr: {trainer.learning_rate:f}--------")
+              f"lr: {optimizer._decayed_lr(tf.float32).numpy():f}--------")
         
         # Training loop
-        train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar)
+        train_iter = tqdm(train_data, desc="Iteration", disable=args.disable_progress_bar)
         start_time = time.time()
         for batch in train_iter:
-            # Move to device
-            batch = tuple(t.copyto(mxnet.gpu()) for t in batch)
-            input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-            # Compute prediction and loss
-            with mxnet.autograd.record():
-                start_logits, end_logits = model(input_ids, segment_ids, input_mask)
-                # sometimes the start/end positions are outside our model inputs, we ignore these terms
-                ignored_index = start_logits.shape[1]
-                start_positions = start_positions.clip(0, ignored_index)
-                end_positions = end_positions.clip(0, ignored_index)
-                # WARNING: NO ignore index in mxnet
-                loss_fct = mxnet.gluon.loss.SoftmaxCrossEntropyLoss()
-                start_loss = loss_fct(start_logits, start_positions).mean()
-                end_loss = loss_fct(end_logits, end_positions).mean()
-                loss = (start_loss + end_loss) / 2
-            # Backpropagation
-            loss.backward()
-            # Update (TODO: gradient clipping max_grad_norm=1.0)
-            trainer.step(1)
+            loss = train_step(batch)
 
-        final_loss = loss.asscalar()
+        # Training process end
         total_train_time += time.time() - start_time
-        print(f"Train: Loss(last step): {final_loss:>.4e}, " + 
-            f"Batch Time: {(time.time() - start_time) * 1e3 /step_size:>.2f}ms")
+        print(f"Train: Loss(last step): {loss:>.4e}, " +
+              f"Batch Time: {(time.time() - start_time) * 1e3 /step_size:>.2f}ms")
 
         if not args.is_prof:
             # Validation process
             all_results = []
-            eval_iter = tqdm(eval_dataloader, desc="Iteration", disable=args.disable_progress_bar)
+            eval_iter = tqdm(eval_data, desc="Iteration", disable=args.disable_progress_bar)
             for batch in eval_iter:
-                # Move to device
-                batch = tuple(t.copyto(mxnet.gpu()) for t in batch)
-                input_ids, input_mask, segment_ids, example_indices = batch
-                # Forward computing
-                with mxnet.autograd.pause():
-                    batch_start_logits, batch_end_logits = model(input_ids, segment_ids, input_mask)
+                batch_start_logits, batch_end_logits = val_step(batch)
+                _, _, _, example_indices = batch
                 for i, example_index in enumerate(example_indices):
-                    start_logits = batch_start_logits[i].asnumpy().tolist()
-                    end_logits = batch_end_logits[i].asnumpy().tolist()
-                    eval_feature = eval_features[example_index.asscalar()]
+                    start_logits = batch_start_logits[i].numpy().tolist()
+                    end_logits = batch_end_logits[i].numpy().tolist()
+                    eval_feature = eval_features[example_index.numpy()]
                     unique_id = int(eval_feature.unique_id)
                     all_results.append(RawResult(unique_id=unique_id,
-                                            start_logits=start_logits,
-                                            end_logits=end_logits))
+                                                start_logits=start_logits,
+                                                end_logits=end_logits))
             
             # Write results into output file
             answers, _ = get_answers(eval_examples, eval_features, all_results, args)
