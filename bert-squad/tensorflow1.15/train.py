@@ -8,12 +8,11 @@ import subprocess
 
 import tensorflow as tf
 from tensorflow.data import Dataset
-from tqdm import *
 
 sys.path.append('..')
 from common.squad import (load_squad_features, RawResult, get_answers)
 from src.config import config
-from src.network import BertForQuestionAnswering
+from src.network import BertForQuestionAnswering, load_numpy_weights_in_bert
 from src.optimizer import create_optimizer
 
 
@@ -77,6 +76,43 @@ def parse_arg():
     args = parser.parse_args()
     return args
 
+def build_train_validation_graph(features, model, training, args):
+    # unpack inputs
+    if training:
+        input_ids, input_mask, segment_ids, start_positions, end_positions = features
+    else:
+        input_ids, input_mask, segment_ids, example_index = features
+    # set mode
+    model.set_training(training)
+    # forward
+    start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+
+    # for eval, just return the result
+    if not training:
+        return start_logits, end_logits, example_index
+    
+    def compute_loss(logits, positions):
+        return tf.compat.v1.losses.sparse_softmax_cross_entropy(
+            logits=logits, labels=positions, reduction=tf.compat.v1.losses.Reduction.SUM_OVER_BATCH_SIZE)
+    
+    start_positions = tf.clip_by_value(start_positions, 0, args.max_seq_length)
+    end_positions = tf.clip_by_value(end_positions, 0, args.max_seq_length)
+    start_loss = compute_loss(start_logits, start_positions)
+    end_loss = compute_loss(end_logits, end_positions)
+    total_loss = (start_loss + end_loss) / 2.0
+
+    # Update
+    assert config['optimizer-type'] == 'AdamW'
+    lr = config['lr-base'] * config["train-batch-size"] / config['lr-batch-denom']
+    train_op = create_optimizer(total_loss, lr, args.num_train_optimization_steps,
+                                int(args.num_train_optimization_steps*config['lr-warmup-proportion']),
+                                weight_decay_rate=0.01,
+                                beta_1=0.9,
+                                beta_2=0.999,
+                                epsilon=1e-6,
+                                exclude_from_weight_decay=['LayerNorm', 'layer_norm', 'bias'])
+    return total_loss, train_op
+
 def main():
     
     args = parse_arg()
@@ -92,12 +128,7 @@ def main():
     _cuda_tools_ext = ctypes.CDLL("libnvToolsExt.so")
 
     # model
-    model = BertForQuestionAnswering.from_pretrained(args.bert_model, args.max_seq_length)
-    print(f"Load model from pretrained: {args.bert_model}")
-    for param in list(model.get_weights()):
-        mean = tf.math.reduce_mean(param)
-        var = tf.math.reduce_variance(param)
-        print(f": {mean:.6f}, {var:.6f}")
+    model_fn = BertForQuestionAnswering.from_pretrained(args.bert_model, args.max_seq_length)
 
     # Train DataLoader
     _, train_features = load_squad_features(args, config["train-file"], True)
@@ -110,10 +141,15 @@ def main():
                                              all_start_positions, all_end_positions))
     # Shuffles records & repeating for training
     train_data = train_data.shuffle(100).batch(
-        config["train-batch-size"], drop_remainder=False).prefetch(buffer_size=tf.data.AUTOTUNE)
+        config["train-batch-size"], drop_remainder=False).prefetch(buffer_size=tf.contrib.data.AUTOTUNE)
     
     step_size = int(len(train_features) / config["train-batch-size"])
-    num_train_optimization_steps = step_size * args.num_train_epochs
+    args.num_train_optimization_steps = step_size * args.num_train_epochs
+
+    # Build the training graph
+    train_iterator = train_data.make_initializable_iterator()
+    train_sample = train_iterator.get_next()
+    train_ops = build_train_validation_graph(train_sample, model_fn, True, args)
     
     # Eval DataLoader
     eval_examples, eval_features = load_squad_features(args, config["predict-file"], False)
@@ -123,96 +159,83 @@ def main():
     all_example_index = tf.range(all_input_ids.shape[0], dtype='int64')
     eval_data = Dataset.from_tensor_slices((all_input_ids, all_input_mask, all_segment_ids, all_example_index))
     # Shuffles records & repeating for training
-    eval_data = eval_data.batch(config["predict-batch-size"], drop_remainder=False).prefetch(buffer_size=tf.data.AUTOTUNE)
+    eval_data = eval_data.batch(config["train-batch-size"], drop_remainder=False).prefetch(buffer_size=tf.contrib.data.AUTOTUNE)
 
-    # Optimizer
-    assert config['optimizer-type'] == 'AdamW'
-    training_vars = model.trainable_variables
-    lr = config['lr-base'] * config["train-batch-size"] / config['lr-batch-denom']
-    optimizer = create_optimizer(lr, num_train_optimization_steps,
-                                 int(num_train_optimization_steps*config['lr-warmup-proportion']), 'adam',     
-                                 weight_decay_rate=0.01,
-                                 beta_1=0.9,
-                                 beta_2=0.999,
-                                 epsilon=1e-6,
-                                 exclude_from_weight_decay=['LayerNorm', 'layer_norm', 'bias'])
+    # Build the eval graph
+    eval_iterator = eval_data.make_initializable_iterator()
+    eval_sample = eval_iterator.get_next()
+    eval_ops = build_train_validation_graph(eval_sample, model_fn, False, args)
     
-    @tf.function
-    def train_step(batch):
-        input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-        with tf.GradientTape() as tape:
-            # Compute prediction and loss
-            start_logits, end_logits = model(input_ids, segment_ids, input_mask, training=True)
-            # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = tf.cast(tf.shape(start_logits)[1], 'int64')
-            start_positions = tf.clip_by_value(start_positions, 0, ignored_index)
-            end_positions = tf.clip_by_value(end_positions, 0, ignored_index)
-            start_loss = tf.keras.backend.sparse_categorical_crossentropy(
-                start_positions, start_logits, from_logits=True)
-            end_loss = tf.keras.backend.sparse_categorical_crossentropy(
-                end_positions, end_logits, from_logits=True)
-            loss = (tf.reduce_mean(start_loss) + tf.reduce_mean(end_loss)) / 2
-        # Backpropagation
-        grads = tape.gradient(loss, training_vars)
-        # Update (TODO: gradient clipping max_grad_norm=1.0)
-        optimizer.apply_gradients(zip(grads, training_vars))
-        return loss
-
-    @tf.function
-    def val_step(batch):
-        input_ids, input_mask, segment_ids, _ = batch
-        # Forward computing
-        return model(input_ids, segment_ids, input_mask, training=False)
-
     # Record the Total time for train
     total_train_time = 0
-    for epoch in range(int(args.num_train_epochs)):
-        # Log some infomations
-        print(f"--------Epoch: {epoch:03}, " +
-              f"lr: {optimizer._decayed_lr(tf.float32).numpy():f}--------")
+    with tf.compat.v1.Session() as sess:
+        # Load model from pretrained
+        load_numpy_weights_in_bert(args.bert_model, sess)
+        tvars = tf.compat.v1.trainable_variables()
+        print(f"Load model from pretrained: {args.bert_model}")
+        mvops = []
+        for param in tvars:
+            mvops.append(tf.math.reduce_mean(param))
+            mvops.append(tf.math.reduce_variance(param))
+        mvop = sess.run(mvops)
         
-        # Training loop
-        train_iter = tqdm(train_data, desc="Iteration", disable=args.disable_progress_bar)
-        start_time = time.time()
-        for batch in train_iter:
-            loss = train_step(batch)
-
-        # Training process end
-        total_train_time += time.time() - start_time
-        print(f"Train: Loss(last step): {loss:>.4e}, " +
-              f"Batch Time: {(time.time() - start_time) * 1e3 /step_size:>.2f}ms")
-
-        if not args.is_prof:
-            # Validation process
-            all_results = []
-            eval_iter = tqdm(eval_data, desc="Iteration", disable=args.disable_progress_bar)
-            for batch in eval_iter:
-                batch_start_logits, batch_end_logits = val_step(batch)
-                _, _, _, example_indices = batch
-                for i, example_index in enumerate(example_indices):
-                    start_logits = batch_start_logits[i].numpy().tolist()
-                    end_logits = batch_end_logits[i].numpy().tolist()
-                    eval_feature = eval_features[example_index.numpy()]
-                    unique_id = int(eval_feature.unique_id)
-                    all_results.append(RawResult(unique_id=unique_id,
-                                                start_logits=start_logits,
-                                                end_logits=end_logits))
+        for i, param in enumerate(tvars):
+            print(f"{param.name}: {mvop[i*2]:.6f}, {mvop[i*2+1]:.6f}")
             
-            # Write results into output file
-            answers, _ = get_answers(eval_examples, eval_features, all_results, args)
-            output_prediction_file = args.output_dir + "/predictions.json"
-            with open(output_prediction_file, "w") as f:
-                f.write(json.dumps(answers, indent=4) + "\n")
+        for epoch in range(int(args.num_train_epochs)):
+            # Log some infomations
+            print(f"--------Epoch: {epoch:03}--------")
+            # Training process
+            start_time = time.time()
+            # _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"epoch:{epoch}".encode('utf-8')))
 
-            # Running the eval script
-            eval_script = os.path.join(os.path.dirname(config["predict-file"]), config["eval_script"])
-            print('script is {}'.format(eval_script))
-            eval_out = subprocess.check_output([sys.executable, eval_script,
-                                                config["predict-file"], output_prediction_file])
-            scores = str(eval_out).strip()
-            exact_match = float(scores.split(":")[1].split(",")[0])
-            f1 = float(scores.split(":")[2].split(",")[0])
-            print(f"Test: exact_match: {exact_match}, F1: {f1}")
+            # Prepare training dataset
+            sess.run(train_iterator.initializer)
+            while True:
+                try:
+                    loss, _ = sess.run(train_ops)
+                except tf.errors.OutOfRangeError:
+                    break
+            # Training end, wait for all compute on gpu complete
+            # _cuda_tools_ext.nvtxRangePop()
+            total_train_time += time.time() - start_time
+            print(f"Train: Loss(last step): {loss:>.4e}, " + 
+                    f"Batch Time: {(time.time() - start_time) * 1e3 /step_size:>.2f}ms")
+
+            if not args.is_prof:
+                # Prepare validation dataset
+                sess.run(eval_iterator.initializer)
+                # Validation process
+                all_results = []
+                while True:
+                    try:
+                        batch_start_logits, batch_end_logits, example_index = sess.run(eval_ops)
+                        for i, example_index in enumerate(example_index):
+                            start_logits = batch_start_logits[i].tolist()
+                            end_logits = batch_end_logits[i].tolist()
+                            eval_feature = eval_features[example_index]
+                            unique_id = int(eval_feature.unique_id)
+                            all_results.append(RawResult(unique_id=unique_id,
+                                                        start_logits=start_logits,
+                                                        end_logits=end_logits))
+                    except tf.errors.OutOfRangeError:
+                        break
+
+                # Write results into output file
+                answers, _ = get_answers(eval_examples, eval_features, all_results, args)
+                output_prediction_file = args.output_dir + "/predictions.json"
+                with open(output_prediction_file, "w") as f:
+                    f.write(json.dumps(answers, indent=4) + "\n")
+
+                # Running the eval script
+                eval_script = os.path.join(os.path.dirname(config["predict-file"]), config["eval_script"])
+                print('script is {}'.format(eval_script))
+                eval_out = subprocess.check_output([sys.executable, eval_script,
+                                                    config["predict-file"], output_prediction_file])
+                scores = str(eval_out).strip()
+                exact_match = float(scores.split(":")[1].split(",")[0])
+                f1 = float(scores.split(":")[2].split(",")[0])
+                print(f"Test: exact_match: {exact_match}, F1: {f1}")
         
     # Print the training time
     print("Time used: %.2fs" % (total_train_time))

@@ -36,67 +36,83 @@ logger = logging.getLogger(__name__)
 CONFIG_NAME = 'bert_config.json'
 WEIGHTS_NAME = 'ckpt.npz'
 
-def load_numpy_weights_in_bert(model, numpy_checkpoint_path):
+def load_numpy_weights_in_bert(pretrained_model_path, sess):
     """ Load tf checkpoints in a pytorch model
     """
+    # Directly load from a TensorFlow checkpoint
+    numpy_checkpoint_path = os.path.join(pretrained_model_path, WEIGHTS_NAME)
     numpy_path = os.path.abspath(numpy_checkpoint_path)
     print('Loading Numpy file {}'.format(numpy_path))
     weights = np.load(numpy_path)
-
-    for name, array in weights.items():
-        name = name.split('/')
-        # adam_v and adam_m are variables used in AdamWeightDecayOptimizer to calculated m and v
-        # which are not required for using pretrained model
-        if any(n in ["adam_v", "adam_m"] for n in name):
-            print("Skipping {}".format("/".join(name)))
-            continue
-        pointer = model
+    
+    init = tf.compat.v1.global_variables_initializer()
+    sess.run(init)
+    
+    assign_ops = []
+    for n in tf.compat.v1.trainable_variables():
         try:
-            for m_name in name:
-                if re.fullmatch(r'[A-Za-z]+_\d+', m_name):
-                    l = re.split(r'_(\d+)', m_name)
-                else:
-                    l = [m_name]
-                if l[0] == 'output_bias':
-                    pointer = getattr(pointer, 'bias')
-                elif l[0] == 'output_weights':
-                    pointer = getattr(pointer, 'weight')
-                elif l[0] == 'output':
-                    pointer = getattr(pointer, 'out')
-                else:
-                    pointer = getattr(pointer, l[0])
-                if len(l) >= 2:
-                    num = int(l[1])
-                    pointer = pointer[num]
-        except AttributeError as e:
-            print(f'Warning: could not find the attribute {name} in the model, last {m_name}')
+            # remove ':0'
+            array = weights[n.name[:-2]]
+            assert n.shape == array.shape
+        except KeyError as e:
+            print(f'Warning: could not find the attribute {n.name} in the ckpt')
             continue
-        if m_name[-11:] == '_embeddings':
-            pointer = getattr(pointer, 'embeddings')
-        try:
-            assert pointer.shape == array.shape
         except AssertionError as e:
-            e.args += (pointer.shape, array.shape)
+            e.args += (n.shape, array.shape)
             raise
-        print("Initialize TensorFlow weight {}".format(name))
-        pointer.assign(tf.convert_to_tensor(array))
-    return model
+        print("Initialize TensorFlow weight {}".format(n.name))
+        assign_ops.append(tf.compat.v1.assign(n, tf.convert_to_tensor(array)))
+    sess.run(assign_ops)
+
+def create_initializer(initializer_range=0.02):
+    """Creates a `random_normal_initializer` with the given range."""
+    return tf.random_normal_initializer(stddev=initializer_range)
 
 def gelu(x):
-    return tf.nn.gelu(x)
+  """Gaussian Error Linear Unit.
 
-def swish(x):
-    return x * tf.nn.sigmoid(x)
+  This is a smoother version of the RELU.
+  Original paper: https://arxiv.org/abs/1606.08415
+  Args:
+    x: float Tensor to perform activation.
 
-def layernorm(_):
-    return tf.keras.layers.LayerNormalization(epsilon=config['ln-epsilon'])
+  Returns:
+    `x` with the GELU activation applied.
+  """
+  cdf = 0.5 * (1.0 + tf.tanh(
+      (np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
+  return x * cdf
 
-def linear(_, out_chs, stddev=0.02):
-    kernel_initializer = tf.keras.initializers.RandomNormal(mean=0.0, stddev=stddev)
-    return tf.keras.layers.Dense(out_chs, use_bias=config['dense-use-bias'], kernel_initializer=kernel_initializer)
+def layernorm(input_tensor, name='LayerNorm'):
+    return tf.contrib.layers.layer_norm(
+        inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+
+def linear(from_tensor_2d, out_chs, name):
+    return tf.layers.dense(
+        from_tensor_2d,
+        out_chs,
+        name=name,
+        kernel_initializer=create_initializer())
+
+def dropout(input_tensor, dropout_prob):
+  """Perform dropout.
+
+  Args:
+    input_tensor: float Tensor.
+    dropout_prob: Python float. The probability of dropping out a value (NOT of
+      *keeping* a dimension as in `tf.nn.dropout`).
+
+  Returns:
+    A version of `input_tensor` with dropout applied.
+  """
+  if dropout_prob is None or dropout_prob == 0.0:
+    return input_tensor
+
+  output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
+  return output
 
 #torch.nn.functional.gelu(x) # Breaks ONNX export
-ACT2FN = {"gelu": gelu, "tanh": tf.nn.tanh,  "relu": tf.nn.relu, "swish": swish}
+ACT2FN = {"gelu": gelu, "tanh": tf.tanh,  "relu": tf.nn.relu}
 
 
 class BertConfig(object):
@@ -195,218 +211,185 @@ class BertConfig(object):
             writer.write(self.to_json_string())
 
 
-class BertEmbeddings(tf.keras.layers.Layer):
+def BertEmbeddings(input_ids, token_type_ids, config):
     """Construct the embeddings from word, position and token_type embeddings.
     """
-    def __init__(self, config):
-        super(BertEmbeddings, self).__init__()
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
-        self.max_position_embeddings = config.max_position_embeddings
-        self.type_vocab_size = config.type_vocab_size
-        self.hidden_dropout_prob = config.hidden_dropout_prob
+    vocab_size = config.vocab_size
+    hidden_size = config.hidden_size
+    max_position_embeddings = config.max_position_embeddings
+    type_vocab_size = config.type_vocab_size
+    hidden_dropout_prob = config.hidden_dropout_prob
+    seq_length = input_ids.shape[1]
 
-        self.word_embeddings = tf.keras.layers.Embedding(self.vocab_size, self.hidden_size)
-        self.position_embeddings = tf.keras.layers.Embedding(self.max_position_embeddings, self.hidden_size)
-        self.token_type_embeddings = tf.keras.layers.Embedding(self.type_vocab_size, self.hidden_size)
+    position_ids = tf.range(seq_length, dtype='int64')
+    position_ids = tf.expand_dims(position_ids, axis=0)
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = layernorm(self.hidden_size)
-        self.dropout = tf.keras.layers.Dropout(self.hidden_dropout_prob)
+    # works embeddings
+    word_embeddings_table = tf.compat.v1.get_variable(
+        name='word_embeddings',
+        shape=[vocab_size, hidden_size],
+        initializer=create_initializer())
+    words_embeddings = tf.gather(word_embeddings_table, input_ids)
+    # position embeddings
+    position_embeddings_table = tf.compat.v1.get_variable(
+        name='position_embeddings',
+        shape=[max_position_embeddings, hidden_size],
+        initializer=create_initializer())
+    position_embeddings = tf.gather(position_embeddings_table, position_ids)
+    # token type embeddings
+    token_type_embeddings_table = tf.compat.v1.get_variable(
+        name='token_type_embeddings',
+        shape=[type_vocab_size, hidden_size],
+        initializer=create_initializer())
+    token_type_embeddings = tf.gather(token_type_embeddings_table, token_type_ids)
 
-    def call(self, input_ids, token_type_ids):
-        seq_length = tf.shape(input_ids)[1]
-        position_ids = tf.range(seq_length, dtype='int64')
-        position_ids = tf.expand_dims(position_ids, axis=0)
+    embeddings = words_embeddings + position_embeddings + token_type_embeddings
+    embeddings = layernorm(embeddings, 'LayerNorm')
+    embeddings = dropout(embeddings, hidden_dropout_prob)
 
-        words_embeddings = self.word_embeddings(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
-
-        embeddings = words_embeddings + position_embeddings + token_type_embeddings
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-
-        return embeddings
+    return embeddings
 
 
-class BertSelfAttention(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertSelfAttention, self).__init__()
-        if config.hidden_size % config.num_attention_heads != 0:
-            raise ValueError(
-                "The hidden size (%d) is not a multiple of the number of attention "
-                "heads (%d)" % (config.hidden_size, config.num_attention_heads))
-        self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-        self.query = linear(config.hidden_size, self.all_head_size)
-        self.key = linear(config.hidden_size, self.all_head_size)
-        self.value = linear(config.hidden_size, self.all_head_size)
+def BertSelfAttention(hidden_states, attention_mask, config):
+    if config.hidden_size % config.num_attention_heads != 0:
+        raise ValueError(
+            "The hidden size (%d) is not a multiple of the number of attention "
+            "heads (%d)" % (config.hidden_size, config.num_attention_heads))
+    
+    num_attention_heads = config.num_attention_heads
+    attention_head_size = int(config.hidden_size / config.num_attention_heads)
+    all_head_size = num_attention_heads * attention_head_size
+    attention_probs_dropout_prob = config.attention_probs_dropout_prob
 
-        self.dropout = tf.keras.layers.Dropout(config.attention_probs_dropout_prob)
+    # (seq, bsz, hidden)
+    hshape = hidden_states.shape
+    seq_length = hshape[0]
 
-    def transpose_for_scores(self, x):
+    def transpose_for_scores(x):
         # seq: x.size(0), bsz: x.size(0)
-        shape = tf.shape(x)
-        x = tf.reshape(x, (shape[0], shape[1] * self.num_attention_heads, self.attention_head_size))
+        x = tf.reshape(x, (seq_length, -1, attention_head_size))
         x = tf.transpose(x, (1, 0, 2))
         return x
 
-    def transpose_key_for_scores(self, x):
+    def transpose_key_for_scores(x):
         # seq: x.size(0), bsz: x.size(0)
-        shape = tf.shape(x)
-        x = tf.reshape(x, (shape[0], shape[1] * self.num_attention_heads, self.attention_head_size))
+        x = tf.reshape(x, (seq_length, -1, attention_head_size))
         x = tf.transpose(x, (1, 2, 0))
         return x
 
-    def call(self, hidden_states, attention_mask):
-        # (seq, bsz, hidden)
-        hshape = tf.shape(hidden_states)
-        batch_size = hshape[1]
-        seq_length = hshape[0]
+    mixed_query_layer = linear(hidden_states, all_head_size, 'query')
+    mixed_key_layer = linear(hidden_states, all_head_size, 'key')
+    mixed_value_layer = linear(hidden_states, all_head_size, 'value')
 
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+    query_layer = transpose_for_scores(mixed_query_layer)
+    key_layer = transpose_key_for_scores(mixed_key_layer)
+    value_layer = transpose_for_scores(mixed_value_layer)
 
-        query_layer = self.transpose_for_scores(mixed_query_layer)
-        key_layer = self.transpose_key_for_scores(mixed_key_layer)
-        value_layer = self.transpose_for_scores(mixed_value_layer)
+    # Take the dot product between "query" and "key" to get the raw attention scores.
+    attention_scores = tf.matmul(query_layer, key_layer)
+    # (bsz, heads, seq, seq)
+    attention_scores = tf.reshape(attention_scores, (-1,
+                                                     num_attention_heads,
+                                                     seq_length, seq_length))
+    attention_scores = attention_scores / math.sqrt(attention_head_size)
+    # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+    attention_scores = attention_scores + attention_mask
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = tf.matmul(query_layer, key_layer)
-        # (bsz, heads, seq, seq)
-        attention_scores = tf.reshape(attention_scores, (batch_size,
-                                                        self.num_attention_heads,
-                                                        seq_length, seq_length))
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-        # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
-        attention_scores = attention_scores + attention_mask
+    # Normalize the attention scores to probabilities.
+    attention_probs = tf.nn.softmax(attention_scores, axis=-1)
 
-        # Normalize the attention scores to probabilities.
-        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+    # This is actually dropping out entire tokens to attend to, which might
+    # seem a bit unusual, but is taken from the original Transformer paper.
+    # (bsz, heads, seq, seq)
+    attention_probs = dropout(attention_probs, attention_probs_dropout_prob)
+    attention_probs = tf.reshape(attention_probs, (-1,
+                                                   seq_length, seq_length))
 
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        # (bsz, heads, seq, seq)
-        attention_probs = self.dropout(attention_probs)
-        attention_probs = tf.reshape(attention_probs, (batch_size * self.num_attention_heads,
-                                                       seq_length, seq_length))
+    context_layer = tf.matmul(attention_probs, value_layer)
+    context_layer = tf.transpose(context_layer, (1, 0, 2))
+    # (seq, bsz, hidden)
+    context_layer = tf.reshape(context_layer, (seq_length, -1, all_head_size))
 
-        context_layer = tf.matmul(attention_probs, value_layer)
-        context_layer = tf.transpose(context_layer, (1, 0, 2))
-        # (seq, bsz, hidden)
-        context_layer = tf.reshape(context_layer, (seq_length, batch_size, self.all_head_size))
-
-        return context_layer
+    return context_layer
 
 
-class BertSelfOutput(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertSelfOutput, self).__init__()
-        self.dense = linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = layernorm(config.hidden_size)
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+def BertSelfOutput(hidden_states, input_tensor, config):
+    hidden_size = config.hidden_size
+    hidden_dropout_prob = config.hidden_dropout_prob
 
-    def call(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
+    hidden_states = linear(hidden_states, hidden_size, name='dense')
+    hidden_states = dropout(hidden_states, hidden_dropout_prob)
+    hidden_states = layernorm(hidden_states + input_tensor)
+    return hidden_states
 
 
-class BertAttention(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertAttention, self).__init__()
-        self.self = BertSelfAttention(config)
-        self.out = BertSelfOutput(config)
-
-    def call(self, input_tensor, attention_mask):
-        self_output = self.self(input_tensor, attention_mask)
-        attention_output = self.out(self_output, input_tensor)
-        return attention_output
+def BertAttention(input_tensor, attention_mask, config):
+    with tf.compat.v1.variable_scope("self"):
+        self_output = BertSelfAttention(input_tensor, attention_mask, config)
+    with tf.compat.v1.variable_scope("output"):
+        attention_output = BertSelfOutput(self_output, input_tensor, config)
+    return attention_output
 
 
-class BertIntermediate(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertIntermediate, self).__init__()
-        self.dense = linear(config.hidden_size, config.intermediate_size)
-        self.act = ACT2FN[config.hidden_act]
+def BertIntermediate(hidden_states, config):
+    intermediate_size = config.intermediate_size
+    hidden_act = config.hidden_act
 
-    def call(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        return self.act(hidden_states)
+    hidden_states = linear(hidden_states, intermediate_size, 'dense')
+    return ACT2FN[hidden_act](hidden_states)
 
 
-class BertOutput(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertOutput, self).__init__()
-        self.dense = linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = layernorm(config.hidden_size)
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+def BertOutput(hidden_states, input_tensor, config):
+    hidden_size = config.hidden_size
+    hidden_dropout_prob = config.hidden_dropout_prob
 
-    def call(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
+    hidden_states = linear(hidden_states, hidden_size, 'dense')
+    hidden_states = dropout(hidden_states, hidden_dropout_prob)
+    hidden_states = layernorm(hidden_states + input_tensor)
+    return hidden_states
 
 
-class BertLayer(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertLayer, self).__init__()
-        self.attention = BertAttention(config)
-        self.intermediate = BertIntermediate(config)
-        self.out = BertOutput(config)
-
-    def call(self, hidden_states, attention_mask):
-        attention_output = self.attention(hidden_states, attention_mask)
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.out(intermediate_output, attention_output)
-
-        return layer_output
+def BertLayer(hidden_states, attention_mask, config):
+    with tf.compat.v1.variable_scope("attention"):
+        attention_output = BertAttention(hidden_states, attention_mask, config)
+    with tf.compat.v1.variable_scope("intermediate"):
+        intermediate_output = BertIntermediate(attention_output, config)
+    with tf.compat.v1.variable_scope("output"):
+        layer_output = BertOutput(intermediate_output, attention_output, config)
+    return layer_output
 
 
-class BertEncoder(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertEncoder, self).__init__()
-        self.layer = [BertLayer(config) for _ in range(config.num_hidden_layers)]
-        self.output_all_encoded_layers = config.output_all_encoded_layers
+def BertEncoder(hidden_states, attention_mask, config):
+    num_hidden_layers = config.num_hidden_layers
+    output_all_encoded_layers = config.output_all_encoded_layers
 
-    def call(self, hidden_states, attention_mask):
-        all_encoder_layers = []
-
-        # (bsz, seq, hidden) => (seq, bsz, hidden)
-        hidden_states = tf.transpose(hidden_states, (1, 0, 2))
-        for i, layer_module in enumerate(self.layer):
-            hidden_states = layer_module(hidden_states, attention_mask)
-
-            if self.output_all_encoded_layers:
+    all_encoder_layers = []
+    # (bsz, seq, hidden) => (seq, bsz, hidden)
+    hidden_states = tf.transpose(hidden_states, (1, 0, 2))
+    for layer_idx in range(num_hidden_layers):
+        with tf.compat.v1.variable_scope("layer_%d" % layer_idx):
+            hidden_states = BertLayer(hidden_states, attention_mask, config)
+            if output_all_encoded_layers:
                 all_encoder_layers.append(hidden_states)
-        # The hidden states need to be contiguous at this point to enable
-        # dense_sequence_output
-        # (seq, bsz, hidden) => (bsz, seq, hidden)
-        hidden_states = tf.transpose(hidden_states, (1, 0, 2))
 
-        if not self.output_all_encoded_layers:
-            all_encoder_layers.append(hidden_states)
-        return all_encoder_layers
+    # The hidden states need to be contiguous at this point to enable
+    # dense_sequence_output
+    # (seq, bsz, hidden) => (bsz, seq, hidden)
+    hidden_states = tf.transpose(hidden_states, (1, 0, 2))
 
+    if not output_all_encoded_layers:
+        all_encoder_layers.append(hidden_states)
+    return all_encoder_layers
+    
 
-class BertPooler(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(BertPooler, self).__init__()
-        self.dense = linear(config.hidden_size, config.hidden_size)
-        self.act = ACT2FN["tanh"]
-
-    def call(self, hidden_states):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token.
-        first_token_tensor = hidden_states[:, 0]
-        pooled_output = self.dense(first_token_tensor)
-        return self.act(pooled_output)
+def BertPooler(hidden_states, config):
+    hidden_size = config.hidden_size
+    
+    # We "pool" the model by simply taking the hidden state corresponding
+    # to the first token.
+    first_token_tensor = hidden_states[:, 0]
+    pooled_output = linear(first_token_tensor, hidden_size, 'dense')
+    return ACT2FN["tanh"](pooled_output)
 
 
 class BertPreTrainedModel(tf.keras.Model):
@@ -422,20 +405,17 @@ class BertPreTrainedModel(tf.keras.Model):
                 "`model = {}.from_pretrained(PRETRAINED_MODEL_NAME)`".format(
                     self.__class__.__name__, self.__class__.__name__
                 ))
+        self.origin_hidden_dropout_prob = config.hidden_dropout_prob
+        self.origin_attention_probs_dropout_prob = config.attention_probs_dropout_prob
         self.config = config
-
-    def init_bert_weights(self, module):
-        """ Initialize the weights.
-        """
-        if isinstance(module, (tf.keras.layers.Dense, tf.keras.layers.Embedding)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.assign(tf.random.normal(mean=0.0, stddev=self.config.initializer_range))
-        elif isinstance(module, tf.keras.layers.LayerNormalization):
-            module.bias.assign(tf.zeros_like(module.bias))
-            module.weight.assign(tf.ones_like(module.weight))
-        if isinstance(module, tf.keras.layers.Dense) and module.bias is not None:
-            module.bias.assign(tf.zeros_like(module.bias))
+    
+    def set_training(self, is_training=True):
+        if is_training:
+            self.config.hidden_dropout_prob = self.origin_hidden_dropout_prob
+            self.config.attention_probs_dropout_prob = self.origin_attention_probs_dropout_prob
+        else:
+            self.config.hidden_dropout_prob = 0.0
+            self.config.attention_probs_dropout_prob = 0.0
 
     def enable_apex(self, val):
         def _apply_flag(module):
@@ -478,10 +458,8 @@ class BertPreTrainedModel(tf.keras.Model):
         # Instantiate model.
         model = cls(config, *inputs, **kwargs)
         # Build the model
-        model(**model.dummy_inputs, training=False)
-        # Directly load from a TensorFlow checkpoint
-        weights_path = os.path.join(pretrained_model_path, WEIGHTS_NAME)
-        return load_numpy_weights_in_bert(model, weights_path)
+        model(**model.dummy_inputs)
+        return model
     
     @property
     def dummy_inputs(self):
@@ -539,16 +517,7 @@ class BertModel(BertPreTrainedModel):
     all_encoder_layers, pooled_output = model(input_ids, token_type_ids, input_mask)
     ```
     """
-    def __init__(self, config):
-        super(BertModel, self).__init__(config)
-
-        self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
-
-        self.pooler = BertPooler(config)
-        self.output_all_encoded_layers = config.output_all_encoded_layers
-
-    def call(self, input_ids, token_type_ids, attention_mask):
+    def __call__(self, input_ids, token_type_ids, attention_mask):
         # We create a 3D attention mask from a 2D tensor mask.
         # Sizes are [batch_size, 1, 1, to_seq_length]
         # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
@@ -559,24 +528,27 @@ class BertModel(BertPreTrainedModel):
         if token_type_ids is None:
             token_type_ids = tf.zeros_like(input_ids)
 
-        embedding_output = self.embeddings(input_ids, token_type_ids)
+        with tf.compat.v1.variable_scope("bert", reuse=tf.compat.v1.AUTO_REUSE):
+            with tf.compat.v1.variable_scope("embeddings"):
+                embedding_output = BertEmbeddings(input_ids, token_type_ids, config=self.config)
 
-        extended_attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, axis=1), axis=2)
+            extended_attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, axis=1), axis=2)
 
-        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-        # masked positions, this operation will create a tensor which is 0.0 for
-        # positions we want to attend and -10000.0 for masked positions.
-        # Since we are adding it to the raw scores before the softmax, this is
-        # effectively the same as removing these entirely.
-        extended_attention_mask = tf.cast(extended_attention_mask, dtype=self.embeddings.word_embeddings.embeddings.dtype) # fp16 compatibility
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+            # masked positions, this operation will create a tensor which is 0.0 for
+            # positions we want to attend and -10000.0 for masked positions.
+            # Since we are adding it to the raw scores before the softmax, this is
+            # effectively the same as removing these entirely.
+            extended_attention_mask = tf.cast(extended_attention_mask, dtype='float32')
+            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
-        encoded_layers = self.encoder(embedding_output, extended_attention_mask)
+            with tf.compat.v1.variable_scope("encoder"):
+                encoded_layers = BertEncoder(embedding_output, extended_attention_mask, config=self.config)
         
         #see paddle
         #sequence_output = encoded_layers[-1]
         #pooled_output = self.pooler(sequence_output)
-        if not self.output_all_encoded_layers:
+        if not self.config.output_all_encoded_layers:
             encoded_layers = encoded_layers[-1:]
         return encoded_layers, None#pooled_output
 
@@ -621,28 +593,30 @@ class BertForQuestionAnswering(BertPreTrainedModel):
     """
     def __init__(self, config, max_seq_length=384):
         super(BertForQuestionAnswering, self).__init__(config)
+        self.bert = BertModel(config)
         self.max_seq_length = max_seq_length
 
-        self.bert = BertModel(config)
-        # TODO check with Google if it's normal there is no dropout on the token classifier of SQuAD in the TF version
-        # self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-        self.qa_outputs = linear(config.hidden_size, 2)  
-        # self.apply(self.init_bert_weights)
-
-    def call(self, input_ids, token_type_ids, attention_mask):
+    def __call__(self, input_ids, token_type_ids, attention_mask):
         encoded_layers, _ = self.bert(input_ids, token_type_ids, attention_mask)
         sequence_output = encoded_layers[-1]
-        logits = self.qa_outputs(sequence_output)
+        
+        # TODO check with Google if it's normal there is no dropout on the token classifier of SQuAD in the TF version
+        # self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        with tf.compat.v1.variable_scope('qa_outputs', reuse=tf.compat.v1.AUTO_REUSE):
+            logits = linear(sequence_output, 2, None)
         start_logits, end_logits = tf.split(logits, 2, axis=-1)
         start_logits = tf.squeeze(start_logits, -1)
         end_logits = tf.squeeze(end_logits, -1)
         return start_logits, end_logits
     
+    def set_training(self, is_training=True):
+        self.bert.set_training(is_training)
+        return super().set_training(is_training)
+    
     @property
     def dummy_inputs(self):
         dummy = {}
-        dummy['input_ids'] = tf.ones(shape=(1, self.max_seq_length), dtype='int64')
-        dummy['token_type_ids'] = tf.ones(shape=(1, self.max_seq_length), dtype='int64')
-        dummy['attention_mask'] = tf.ones(shape=(1, self.max_seq_length), dtype='int64')
+        dummy['input_ids'] = tf.compat.v1.placeholder(tf.int64, (1, self.max_seq_length), 'input_ids')
+        dummy['token_type_ids'] = tf.compat.v1.placeholder(tf.int64, (1, self.max_seq_length), 'token_type_ids')
+        dummy['attention_mask'] = tf.compat.v1.placeholder(tf.int64, (1, self.max_seq_length), 'attention_mask')
         return dummy
