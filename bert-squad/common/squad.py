@@ -31,20 +31,20 @@ def load_squad_features(args, file, is_training):
         
     vocab_file = os.path.join(os.path.abspath(args.bert_model), VOCAB_NAME)
     # tokenization
-    logger.info(f"Loading the vocab file: {vocab_file}")
+    print(f"Loading the vocab file: {vocab_file}")
     tokenizer = BertTokenizer(vocab_file, do_lower_case=args.do_lower_case, max_len=512) # for bert large
     # samples
-    logger.info(f"Loading the training file: {file}")
+    print(f"Loading the {'training' if is_training else 'evaluation'} file: {file}")
     examples = read_squad_examples(
         input_file=file, is_training=is_training, version_2_with_negative=args.version_2_with_negative)
     
     try:
         with open(cached_features_file, "rb") as reader:
             features = pickle.load(reader)
-        logger.info(f"Loaded train features from cache: {cached_features_file}")
+        print(f"Loaded {'training' if is_training else 'evaluation'} features from cache: {cached_features_file}")
     except:
         # samples to features
-        logger.info(f"Converting samples to features")
+        print(f"Converting samples to features")
         features = convert_examples_to_features(
                         examples=examples,
                         tokenizer=tokenizer,
@@ -53,7 +53,7 @@ def load_squad_features(args, file, is_training):
                         max_query_length=args.max_query_length,
                         is_training=is_training)
         if not args.skip_cache:
-            logger.info(f"Cached_train features_file: {cached_features_file}")
+            print(f"Cached_train features_file: {cached_features_file}")
             with open(cached_features_file, "wb") as writer:
                 pickle.dump(features, writer)
     return examples, features

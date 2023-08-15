@@ -16,6 +16,7 @@ from src.config import config
 from src.network import BertForQuestionAnswering
 from src.optimizer import create_optimizer
 
+PROF_SAMPLES_PER_EPOCH = 3200
 
 def parse_arg():
     parser = argparse.ArgumentParser()
@@ -70,10 +71,12 @@ def parse_arg():
                         default=None,
                         type=str,
                         help="Location to cache train feaures. Will default to the dataset directory")
-    parser.add_argument("--is_prof",
+    parser.add_argument("--is-prof",
                         default=False,
                         action='store_true',
                         help="Whether to profile model.")
+    parser.add_argument("--train-batch-size", default=None, type=int,
+                        help="The batch size of training.")
     args = parser.parse_args()
     return args
 
@@ -84,6 +87,8 @@ def main():
     for k, v in vars(args).items():
         print(k,':',v)
     print("-------------------------------------")
+    if args.train_batch_size is not None:
+        config['train-batch-size'] = args.train_batch_size
 
     # make output dir if not exist
     if not os.path.exists(args.output_dir):
@@ -174,10 +179,16 @@ def main():
         # Training loop
         train_iter = tqdm(train_data, desc="Iteration", disable=args.disable_progress_bar)
         start_time = time.time()
-        for batch in train_iter:
+        _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"epoch:{epoch}".encode('utf-8')))
+        for num_steps, batch in enumerate(train_iter):
             loss = train_step(batch)
+            if args.is_prof:
+                through_samples =  (num_steps + 1) * config["train-batch-size"]
+                if through_samples >= PROF_SAMPLES_PER_EPOCH:
+                    break
 
         # Training process end
+        _cuda_tools_ext.nvtxRangePop()
         total_train_time += time.time() - start_time
         print(f"Train: Loss(last step): {loss:>.4e}, " +
               f"Batch Time: {(time.time() - start_time) * 1e3 /step_size:>.2f}ms")
