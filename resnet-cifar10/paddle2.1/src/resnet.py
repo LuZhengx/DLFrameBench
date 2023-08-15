@@ -108,7 +108,7 @@ class ResNet(paddle.nn.Layer):
 
     return paddle.nn.Sequential(*tuple(layers))
   
-  #@paddle.jit.to_static
+  @paddle.jit.to_static
   def forward(self, inputs):
     x = self.conv1(inputs)
     x = self.bn1(x)
