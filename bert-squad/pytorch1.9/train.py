@@ -177,11 +177,14 @@ def main():
         # Training loop
         start_time = time.time()
         _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"epoch:{epoch}".encode('utf-8')))
+        _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
         for num_steps, batch in enumerate(train_iter):
             # Move to device
             batch = tuple(t.to(device) for t in batch)
             input_ids, input_mask, segment_ids, start_positions, end_positions = batch
             # Compute prediction and loss
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"forward".encode('utf-8')))
             start_logits, end_logits = model(input_ids, segment_ids, input_mask)
             # sometimes the start/end positions are outside our model inputs, we ignore these terms
             ignored_index = start_logits.size(1)
@@ -192,16 +195,25 @@ def main():
             end_loss = loss_fct(end_logits, end_positions)
             loss = (start_loss + end_loss) / 2
             # Backpropagation
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient clean".encode('utf-8')))
             optimizer.zero_grad()
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"backpropagation".encode('utf-8')))
             loss.backward()
             # Update (TODO: gradient clipping max_grad_norm=1.0)
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient update".encode('utf-8')))
             optimizer.step()
             scheduler.step()
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
             if args.is_prof:
                 through_samples =  (num_steps + 1) * config["train-batch-size"]
                 if through_samples >= PROF_SAMPLES_PER_EPOCH:
                     break
 
+        _cuda_tools_ext.nvtxRangePop()
         final_loss = loss.item()
         _cuda_tools_ext.nvtxRangePop()
         total_train_time += time.time() - start_time

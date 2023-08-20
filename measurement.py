@@ -11,8 +11,8 @@ threshold = {
   'resnet110': 100*(1-0.0643)
 }
 sqlite_path = "/tmp/gpu-metric.sqlite"
-# nvtx_list = ["prepare data", "forward", "gradient clean", "backpropagation", "gradient update"]
-nvtx_list = []#["prepare data", "forward", "gradient clean", "backpropagation", "gradient update"]
+nvtx_list = ["prepare data", "forward", "gradient clean", "backpropagation", "gradient update"]
+# nvtx_list = []#["prepare data", "forward", "gradient clean", "backpropagation", "gradient update"]
 
 
 def mean(list):
@@ -201,13 +201,13 @@ if __name__ == '__main__':
     for fname in os.listdir(base_path):
       print(f"processing log file {fname} ...")
       metrics.append(Baseline(os.path.join(base_path, fname)))
-    dirs.remove("baseline")
 
   # GPU metrics
   for dir in dirs:
-    g = re.match('([a-zA-Z0-9-]*)-([0-9]*)', dir)
-    # Assert the dirname is correct
-    assert g
+    g = re.match('([a-zA-Z0-9]*)-([0-9]*)', dir)
+    # Process only the correct dirname
+    if not g:
+      continue
     metric = {"Arch": g.group(1), "Batch Size": int(g.group(2))}
     # Remove the exist item in metrics
     for m in metrics:

@@ -6,6 +6,8 @@ import argparse
 import ctypes
 import subprocess
 
+os.environ['FLAGS_cudnn_exhaustive_search']='True'
+
 import paddle
 from paddle.io import Dataset, DataLoader
 from tqdm import *
@@ -127,6 +129,11 @@ def main():
         mean = param.mean().item()
         var = param.var().item()
         print(f"{name}: {mean:.6f}, {var:.6f}")
+    # # to static
+    # input_ids_spec = paddle.static.InputSpec(shape=[1, args.max_seq_length], dtype=paddle.int64)  # 动态 shape
+    # segment_ids_spec = paddle.static.InputSpec(shape=[1, args.max_seq_length], dtype=paddle.int64)
+    # input_mask_spec = paddle.static.InputSpec(shape=[1, args.max_seq_length], dtype=paddle.int64)
+    # model = paddle.jit.to_static(model, input_spec=[input_ids_spec, segment_ids_spec, input_mask_spec])
 
     # Train DataLoader
     _, train_features = load_squad_features(args, config["train-file"], True)
@@ -173,9 +180,12 @@ def main():
         # Training loop
         start_time = time.time()
         _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"epoch:{epoch}".encode('utf-8')))
+        _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
         for num_steps, batch in enumerate(train_iter):
             input_ids, input_mask, segment_ids, start_positions, end_positions = batch
             # Compute prediction and loss
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"forward".encode('utf-8')))
             start_logits, end_logits = model(input_ids, segment_ids, input_mask)
             # sometimes the start/end positions are outside our model inputs, we ignore these terms
             ignored_index = start_logits.shape[1]
@@ -186,16 +196,27 @@ def main():
             end_loss = loss_fct(end_logits, end_positions)
             loss = (start_loss + end_loss) / 2
             # Backpropagation
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient clean".encode('utf-8')))
             optimizer.clear_grad()
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"backpropagation".encode('utf-8')))
             loss.backward()
             # Update (TODO: gradient clipping max_grad_norm=1.0)
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"gradient update".encode('utf-8')))
             optimizer.step()
             scheduler.step()
+            _cuda_tools_ext.nvtxRangePop()
+            _cuda_tools_ext.nvtxRangePushA(ctypes.c_char_p(f"prepare data".encode('utf-8')))
             if args.is_prof:
                 through_samples =  (num_steps + 1) * config["train-batch-size"]
                 if through_samples >= PROF_SAMPLES_PER_EPOCH:
                     break
+                if num_steps > 11:
+                    break
 
+        _cuda_tools_ext.nvtxRangePop()
         final_loss = loss.item()
         _cuda_tools_ext.nvtxRangePop()
         total_train_time += time.time() - start_time

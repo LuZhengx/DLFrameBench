@@ -249,17 +249,16 @@ class BertSelfAttention(nn.Layer):
 
     def transpose_for_scores(self, x):
         # seq: x.size(0), bsz: x.size(0)
-        x = x.reshape((x.shape[0], x.shape[1] * self.num_attention_heads, self.attention_head_size)).transpose((1, 0, 2))
+        x = x.reshape((x.shape[0], -1, self.attention_head_size)).transpose((1, 0, 2))
         return x
 
     def transpose_key_for_scores(self, x):
         # seq: x.size(0), bsz: x.size(0)
-        x = x.reshape((x.shape[0], x.shape[1] * self.num_attention_heads, self.attention_head_size)).transpose((1, 2, 0))
+        x = x.reshape((x.shape[0], -1, self.attention_head_size)).transpose((1, 2, 0))
         return x
 
     def forward(self, hidden_states, attention_mask):
         # (seq, bsz, hidden)
-        batch_size = hidden_states.shape[1]
         seq_length = hidden_states.shape[0]
 
         mixed_query_layer = self.query(hidden_states)
@@ -273,7 +272,7 @@ class BertSelfAttention(nn.Layer):
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = paddle.bmm(query_layer, key_layer)
         # (bsz, heads, seq, seq)
-        attention_scores = attention_scores.reshape((batch_size,
+        attention_scores = attention_scores.reshape((-1,
                                                    self.num_attention_heads,
                                                    seq_length, seq_length))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
@@ -287,13 +286,13 @@ class BertSelfAttention(nn.Layer):
         # seem a bit unusual, but is taken from the original Transformer paper.
         # (bsz, heads, seq, seq)
         attention_probs = self.dropout(attention_probs)
-        attention_probs = attention_probs.reshape((batch_size * self.num_attention_heads,
+        attention_probs = attention_probs.reshape((-1,
                                                    seq_length, seq_length))
 
         context_layer = paddle.bmm(attention_probs, value_layer)
         context_layer = context_layer.transpose((1, 0, 2))
         # (seq, bsz, hidden)
-        context_layer = context_layer.reshape((seq_length, batch_size, self.all_head_size))
+        context_layer = context_layer.reshape((seq_length, -1, self.all_head_size))
 
         return context_layer
 
